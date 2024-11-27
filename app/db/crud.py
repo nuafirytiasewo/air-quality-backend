@@ -4,6 +4,8 @@ from app.db.models import User, Subscription, Location, MapCache
 from sqlalchemy.exc import NoResultFound
 from config import MAP_DATA_TTL
 import datetime
+from worker import force_update_database
+import logging
 
 
 def create_or_update_subscription(
@@ -83,6 +85,32 @@ def create_or_update_subscription(
 def get_all_users(db: Session) -> list[Subscription]:
     return db.query(User).all()
 
+def add_locations_from_csv(db: Session, locations_data: list[list[str]]) -> int:
+    count = 0
+    try:
+        for data in locations_data[1:]:
+            city, longitude, latitude, radius = data
+            location_exists = db.query(Location).filter(Location.city == city).first()
+            if location_exists:
+                logging.info(f"Город {city} уже существует в таблице Map")
+                continue
+            location = Location(
+                city=city,
+                longitude=float(longitude),
+                latitude=float(latitude),
+                radius=int(radius.rstrip('\r')),
+                created_by="default"
+            )
+            db.add(location)
+            count += 1
+        db.commit()
+        return count
+    except Exception as e:
+        logging.error(f"Произошла ошибка при добавлении данных в таблицу map: {e}")
+        return 0
+    force_update_database()
+
+
 def update_location_aqi(db: Session, coordinates: dict, current_aqi: int) -> Subscription:
     location = (
         db.query(Location)
@@ -110,7 +138,6 @@ def delete_subscription(db: Session, telegram_id: int) -> bool:
     db.delete(subscription)
     db.commit()
     return True
-
 
 
 # Получение подписки по telegram_id

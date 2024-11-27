@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import aiohttp
+from worker import force_update_database
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.filters import Command
@@ -9,12 +11,29 @@ import app.db.crud as crud
 import app.bot.messages as messages
 from app.bot.utils import get_coordinates
 from air_quality import get_city_by_coords, get_air_pollution_data, get_air_pollution_forecast
-from config import TELEGRAM_BOT_TOKEN, AIR_QUALITY_CHECK_INTERVAL
+from config import TELEGRAM_BOT_TOKEN, AIR_QUALITY_CHECK_INTERVAL, TG_ADMIN_IDs
 from datetime import datetime, time, timedelta
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+
+# Создаем кнопки для клавиатуры
+keyboard = ReplyKeyboardMarkup(
+  keyboard=[
+    [KeyboardButton(text="Проверить качество воздуха")],
+    [KeyboardButton(text="Отписаться от уведомлений")]
+  ],
+  resize_keyboard=True
+)
+
+# Клавиатура админа
+admin_keyboard = ReplyKeyboardMarkup(
+  keyboard=[
+    [KeyboardButton(text="Обновить все данные карты")],
+  ],
+  resize_keyboard=True
+)
 
 # Хэндлер команды /start с кнопками
 @dp.message(Command("start"))
@@ -22,15 +41,6 @@ async def start(message: Message):
   logging.info(f"[TELEGRAM BOT] /start от {message.from_user.id} message: {message.text}")
   coordinates = get_coordinates(message)
   print("coordinates: ", coordinates)
-
-  # Создаем кнопки для клавиатуры
-  keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-      [KeyboardButton(text="Проверить качество воздуха")],
-      [KeyboardButton(text="Отписаться от уведомлений")]
-    ],
-    resize_keyboard=True
-  )
 
   if coordinates:
     try:            
@@ -59,6 +69,26 @@ async def start(message: Message):
   else:
     await message.answer(messages.MESSAGE_COORDINATES_NOT_PROVIDED, reply_markup=keyboard)
 
+# Хэндлер команды /start с кнопками
+@dp.message(Command("admin"))
+async def start(message: Message):
+  if message.from_user.id not in TG_ADMIN_IDs:
+    await message.answer("Вы не имеете доступа к этой функции")
+    return
+
+  logging.info(f"[TELEGRAM BOT] /admin от {message.from_user.id}")
+  await message.answer("Добро пожаловать, господин!", reply_markup=admin_keyboard)
+
+# Хэндлер для обработки текстовых сообщений с кнопок
+@dp.message(lambda message: message.text == "Проверить качество воздуха")
+async def check_air_quality(message: Message):
+  if message.from_user.id not in TG_ADMIN_IDs:
+    await message.answer("Вы не имеете доступа к этой функции")
+    return
+  await message.answer("Обновление данных таблицы Map...")
+  force_update_database()
+  await message.answer("Данные таблицы Map обновлены!", reply_markup=admin_keyboard)
+
 # Хэндлер для обработки текстовых сообщений с кнопок
 @dp.message(lambda message: message.text == "Проверить качество воздуха")
 async def check_air_quality(message: Message):
@@ -71,13 +101,13 @@ async def check_air_quality(message: Message):
         location = user.subscription.location
         air_data = await get_air_pollution_data(location.latitude, location.longitude)
         current_aqi = air_data['list'][0]['main']['aqi']
-        await message.answer(f"Текущий AQI для {location.city}: {current_aqi}")
+        await message.answer(f"Текущий AQI для {location.city}: {current_aqi}", reply_markup=keyboard)
       else:
-        await message.answer(messages.MESSAGE_COORDINATES_NOT_PROVIDED)
+        await message.answer(messages.MESSAGE_COORDINATES_NOT_PROVIDED, reply_markup=keyboard)
   
   except Exception as e:
     logging.error(f"Ошибка при проверке качества воздуха: {e}")
-    await message.answer("Произошла ошибка при проверке качества воздуха.")
+    await message.answer("Произошла ошибка при проверке качества воздуха.", reply_markup=keyboard)
 
 @dp.message(lambda message: message.text == "Отписаться от уведомлений")
 async def unsubscribe(message: Message):
@@ -113,7 +143,7 @@ async def handle_location(message: Message):
       current_aqi=current_aqi
     )
   # Ответ на сообщение с геопозицией
-  await message.answer(f"Спасибо за то что предоставили геопозицию! Ваша геопозиция: Широта {latitude}, Долгота {longitude}. Ваш город: {city}. Текущий AQI: {current_aqi}")
+  await message.answer(f"♥️ Спасибо, ваша подписка сохранена!\n📍 Местоположение: {city}\n☁️ Текущий AQI: {current_aqi}", reply_markup=keyboard)
 
 # Функция отправки уведомлений
 async def send_notifications():
@@ -136,11 +166,11 @@ async def send_notifications():
                     
           # Экстренное уведомление при значительном изменении AQI
           if previous_aqi and current_aqi != previous_aqi:
-            trend = "повышение" if current_aqi > previous_aqi else "понижение"
+            trend = "улучшение" if current_aqi > previous_aqi else "ухудшение"
             crud.update_location_aqi(db, coordinates, current_aqi)
             await bot.send_message(
               user.id, 
-              f"Внимание! В городе {user_city} наблюдается {trend} загрязнения. Текущий AQI: {current_aqi}"
+              f"🌆 В вашем городе {trend} качества воздуха.\n☁️ Текущий AQI: {current_aqi}"
               )
 
           # Прогноз на ближайшие 6 часов для экстренных уведомлений
@@ -148,10 +178,10 @@ async def send_notifications():
           forecast_aqi = [f['main']['aqi'] for f in forecast_data['list'][:6]]
           for i, forecast in enumerate(forecast_aqi):
             if abs(forecast - current_aqi) >= 2:
-              trend = "ухудшение" if forecast > current_aqi else "улучшение"
+              trend = "улучшение" if forecast > current_aqi else "ухудшение"
               hours = (i + 1) * 1
               await bot.send_message(user.id, 
-              f"Внимание! Через {hours} часов ожидается {trend} качества воздуха в городе {user_city}. Прогнозируемый AQI: {forecast}")
+              f"🌆 В вашем городе {trend} качества воздуха.\n☁️ Текущий AQI: {current_aqi}")
               break
 
           # Регулярное уведомление (в 8:00 и 20:00)
@@ -164,6 +194,27 @@ async def send_notifications():
       logging.error(f"Ошибка в функции отправки уведомлений: {e}")
     
     await asyncio.sleep(AIR_QUALITY_CHECK_INTERVAL)
+
+# Хэндлер для обработки файлов
+@dp.message(lambda message: message.document is not None)
+async def handle_csv_file(message: Message):
+  if message.from_user.id not in TG_ADMIN_IDs:
+    await message.answer("Вы не имеете доступа к этой функции")
+    return
+  
+  # Обработка файла
+  file_id = message.document.file_id
+  file_info = await bot.get_file(file_id)
+  file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_info.file_path}"
+  # try:
+  async with aiohttp.ClientSession() as session:
+    async with session.get(file_url) as response:
+      file_data = await response.text()
+      csv_data = [line.split(',') for line in file_data.strip().split('\n')]
+      with get_db() as db:
+        locationsAdded = crud.add_locations_from_csv(db, csv_data)
+        await message.answer(f"Успешно! Было добавлено {locationsAdded} мест.")
+      
 
 # Запуск бота
 async def start_bot():
